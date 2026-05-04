@@ -1,0 +1,93 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Phase 3: Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // User Profile Validation
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'email', 'role']) &&
+             data.uid == request.auth.uid &&
+             data.email == request.auth.token.email &&
+             data.role in ['patient', 'doctor'] &&
+             (!('displayName' in data) || data.displayName is string) &&
+             (!('photoURL' in data) || data.photoURL is string);
+    }
+
+    match /users/{userId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn() && (isOwner(userId) || existing().role == 'doctor'); 
+      allow create: if isEmailVerified() && isOwner(userId) && isValidUser(incoming());
+      allow update: if isEmailVerified() && isOwner(userId) && isValidUser(incoming()) && 
+                    incoming().role == existing().role; // Role is immutable
+    }
+
+    // Health Metrics Validation
+    function isValidMetric(data) {
+      return data.keys().hasAll(['userId', 'type', 'value', 'timestamp']) &&
+             data.userId == request.auth.uid &&
+             data.type in ['heart_rate', 'steps', 'sleep', 'blood_pressure', 'weight'] &&
+             data.value is number &&
+             data.timestamp == request.time;
+    }
+
+    match /health_metrics/{metricId} {
+      allow get: if isSignedIn() && (isOwner(resource.data.userId) || isDoctor(request.auth.uid));
+      allow list: if isSignedIn() && (isOwner(resource.data.userId) || isDoctor(request.auth.uid));
+      allow create: if isEmailVerified() && isValidMetric(incoming());
+      allow delete: if isEmailVerified() && isOwner(existing().userId);
+    }
+
+    function isDoctor(uid) {
+      return get(/databases/$(database)/documents/users/$(uid)).data.role == 'doctor';
+    }
+
+    // Consultations
+    function isValidConsultation(data) {
+      return data.keys().hasAll(['patientId', 'doctorId', 'status', 'startTime']) &&
+             data.status in ['scheduled', 'completed', 'cancelled'] &&
+             isValidId(data.patientId) &&
+             isValidId(data.doctorId);
+    }
+
+    match /consultations/{consId} {
+      allow read: if isSignedIn() && (request.auth.uid == resource.data.patientId || request.auth.uid == resource.data.doctorId);
+      allow create: if isEmailVerified() && (request.auth.uid == incoming().patientId || request.auth.uid == incoming().doctorId) && isValidConsultation(incoming());
+      allow update: if isEmailVerified() && (request.auth.uid == existing().patientId || request.auth.uid == existing().doctorId) && isValidConsultation(incoming());
+    }
+
+    // Predictions (System/AI Only via Server usually, but allowing read for users)
+    match /predictions/{predId} {
+      allow read: if isSignedIn() && isOwner(resource.data.userId);
+      // Writes should ideally be server-side or strictly validated
+      allow write: if false; 
+    }
+  }
+}

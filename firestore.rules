@@ -1,0 +1,103 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isDoctor(uid) {
+      return get(/databases/$(database)/documents/users/$(uid)).data.role == 'doctor';
+    }
+
+    // --- Users ---
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'email', 'role']) &&
+             data.uid == request.auth.uid &&
+             data.email == request.auth.token.email &&
+             data.role in ['patient', 'doctor'] &&
+             (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 100)) &&
+             (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 500));
+    }
+
+    match /users/{userId} {
+      // allow list: MUST enforce security boundaries
+      allow list: if isSignedIn() && (isOwner(userId) || isDoctor(request.auth.uid));
+      allow get: if isSignedIn();
+      allow create: if isEmailVerified() && isOwner(userId) && isValidUser(incoming());
+      allow update: if isEmailVerified() && isOwner(userId) && isValidUser(incoming()) && 
+                    incoming().role == existing().role; 
+    }
+
+    // --- Health Metrics ---
+    function isValidMetric(data) {
+      return data.keys().hasAll(['userId', 'type', 'value', 'timestamp']) &&
+             data.userId == request.auth.uid &&
+             data.type in ['heart_rate', 'steps', 'sleep', 'blood_pressure', 'weight'] &&
+             data.value is number &&
+             data.timestamp == request.time;
+    }
+
+    match /health_metrics/{metricId} {
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isDoctor(request.auth.uid));
+      allow get: if isSignedIn() && (resource.data.userId == request.auth.uid || isDoctor(request.auth.uid));
+      allow create: if isEmailVerified() && isValidMetric(incoming());
+      allow delete: if isEmailVerified() && isOwner(existing().userId);
+    }
+
+    // --- Consultations ---
+    function isValidConsultation(data) {
+      return data.keys().hasAll(['patientId', 'doctorId', 'status', 'startTime']) &&
+             data.status in ['scheduled', 'completed', 'cancelled'] &&
+             isValidId(data.patientId) &&
+             isValidId(data.doctorId) &&
+             // Ensure the user actually exists and is a doctor/patient? 
+             // Simplified for now, but check identities
+             (request.auth.uid == data.patientId || request.auth.uid == data.doctorId);
+    }
+
+    match /consultations/{consId} {
+      allow list: if isSignedIn() && (resource.data.patientId == request.auth.uid || resource.data.doctorId == request.auth.uid);
+      allow get: if isSignedIn() && (resource.data.patientId == request.auth.uid || resource.data.doctorId == request.auth.uid);
+      allow create: if isEmailVerified() && isValidConsultation(incoming());
+      allow update: if isEmailVerified() && 
+                    (request.auth.uid == existing().patientId || request.auth.uid == existing().doctorId) &&
+                    isValidConsultation(incoming()) &&
+                    incoming().patientId == existing().patientId &&
+                    incoming().doctorId == existing().doctorId;
+    }
+
+    // --- Predictions ---
+    match /predictions/{predId} {
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow get: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if false; // Only written by system/service usually
+      allow delete: if false;
+    }
+  }
+}
